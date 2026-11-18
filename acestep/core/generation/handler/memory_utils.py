@@ -198,12 +198,21 @@ class MemoryUtilsMixin:
 
     def _get_vae_dtype(self, device: Optional[str] = None) -> torch.dtype:
         """Get VAE dtype based on target device and GPU tier."""
+        import os as _os
         target_device = device or self.device
         if _is_cuda_device(target_device):
             if is_rocm_available():
                 # On ROCm, defer to self.dtype which is already set to a safe
                 # value (float32 by default, or ACESTEP_ROCM_DTYPE override).
                 return getattr(self, "dtype", torch.float32)
+            # Respect explicit dtype overrides (e.g. ACESTEP_FORCE_DTYPE=bfloat16
+            # on pre-Ampere GPUs where the driver supports bf16 math but the
+            # compute-capability check rejects it).
+            _force = _os.environ.get("ACESTEP_FORCE_DTYPE", "").strip().lower()
+            if _force in ("float32", "fp32"):
+                return torch.float32
+            if _force == "bfloat16":
+                return torch.bfloat16
             if cuda_supports_bfloat16(_cuda_device_index(target_device)):
                 return torch.bfloat16
             return torch.float16
