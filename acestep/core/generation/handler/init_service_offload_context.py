@@ -1,9 +1,17 @@
 """Context manager for temporary model loading/offloading."""
 
+import platform
 import time
 from contextlib import contextmanager
 
 from loguru import logger
+
+# Windows + CUDA triggers a C-level segfault (exit 139) during bulk GPU→CPU
+# tensor transfers via torch.nn.Module.convert(). Skip the offload path entirely
+# on this platform so tensors stay pinned to GPU; generation still works.
+_IS_WINDOWS_CUDA = (
+    platform.system() == "Windows" and platform.machine().startswith("AMD64")
+)
 
 
 class InitServiceOffloadContextMixin:
@@ -13,6 +21,12 @@ class InitServiceOffloadContextMixin:
     def _load_model_context(self, model_name: str):
         """Load a model to device for the context and offload back to CPU on exit."""
         if not self.offload_to_cpu:
+            yield
+            return
+
+        # Skip offload on Windows/CUDA to avoid C-level segfault in libtorch.
+        # Models stay pinned to GPU; generation completes but uses more VRAM.
+        if _IS_WINDOWS_CUDA:
             yield
             return
 
@@ -68,17 +82,27 @@ class InitServiceOffloadContextMixin:
                 f"[_load_model_context] Offloading {model_name} to CPU (RSS: {rss_before:.0f} MB)"
             )
             start_time = time.time()
-            if model_name == "vae":
-                self._recursive_to_device(model, "cpu", self._get_vae_dtype("cpu"))
-            else:
-                self._recursive_to_device(model, "cpu")
-
+            try:
+                if model_name == "vae":
+                    self._recursive_to_device(model, "cpu", self._get_vae_dtype("cpu"))
+                else:
+                    self._recursive_to_device(model, "cpu")
+            except NotImplementedError as e:
+                # Fallback for quantized tensors that reject .to():
+                # fall back to model.to("cpu") which handles AffineQuantizedTensor differently
+                logger.warning(
+                    f"[_load_model_context] Recursive offload failed for {model_name}, "
+                    f"trying direct model.to('cpu'): {e}"
+                )
+                try:
+                    model.to("cpu")
+                except Exception as inner_e:
+                    logger.error(
+                        f"[_load_model_context] Direct offload also failed for {model_name}: {inner_e}"
+                    )
+            self._release_system_memory()
             offload_time = time.time() - start_time
             self.current_offload_cost += offload_time
-
-            # Aggressively reclaim memory: GPU cache + Python GC + OS heap trim
-            # (not counted in offload_time to keep timing accurate)
-            self._release_system_memory()
             rss_after = self._get_rss_mb()
             logger.info(
                 f"[_load_model_context] Offloaded {model_name} to CPU in {offload_time:.4f}s "

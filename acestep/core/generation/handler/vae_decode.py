@@ -98,7 +98,14 @@ class VaeDecodeMixin:
             return result
         finally:
             # Always restore VAE to original device/dtype
-            self.vae = self.vae.to(vae_dtype).to(vae_device)
+            try:
+                self.vae = self.vae.to(vae_dtype).to(vae_device)
+            except Exception as e:
+                import logging
+                logging.warning(
+                    f"[_tiled_decode_cpu_fallback] Failed to restore VAE to GPU: {e}. "
+                    "Some operations may be slower."
+                )
 
     def _decode_on_cpu(self, latents):
         """Move VAE to CPU, decode there, then restore original device."""
@@ -122,7 +129,13 @@ class VaeDecodeMixin:
         finally:
             if original_device.type != "cpu":
                 vae_gpu_dtype = self._get_vae_dtype(str(original_device))
-                self._recursive_to_device(self.vae, original_device, vae_gpu_dtype)
+                try:
+                    self._recursive_to_device(self.vae, original_device, vae_gpu_dtype)
+                except Exception as e:
+                    logger.warning(
+                        f"[_decode_on_cpu] Failed to restore VAE to GPU: {e}. "
+                        "Some operations may be slower."
+                    )
 
         logger.info(f"[_decode_on_cpu] CPU decode complete, result shape={result.shape}")
         return result

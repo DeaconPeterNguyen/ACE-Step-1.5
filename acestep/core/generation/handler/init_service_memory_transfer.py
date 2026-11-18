@@ -26,19 +26,39 @@ class InitServiceMemoryTransferMixin:
                 continue
             if self._is_on_target_device(param, target_device):
                 if dtype is not None and param.is_floating_point() and param.dtype != dtype:
-                    param.data = param.data.to(dtype)
+                    try:
+                        param.data = param.data.to(dtype)
+                    except Exception as e:
+                        logger.warning(
+                            f"[_move_module_recursive] Failed to convert param {param_name} to dtype {dtype}: {e}"
+                        )
                 continue
             if self._is_quantized_tensor(param):
-                module._parameters[param_name] = self._move_quantized_param(param, target_device)
+                try:
+                    module._parameters[param_name] = self._move_quantized_param(param, target_device)
+                except Exception as e:
+                    logger.warning(
+                        f"[_move_module_recursive] Failed to move quantized param {param_name} to {target_device}: {e}"
+                    )
             else:
-                new_data = param.data.to(target_device)
-                if dtype is not None and new_data.is_floating_point():
-                    new_data = new_data.to(dtype)
-                param.data = new_data
+                try:
+                    new_data = param.data.to(target_device)
+                    if dtype is not None and new_data.is_floating_point():
+                        new_data = new_data.to(dtype)
+                    param.data = new_data
+                except Exception as e:
+                    logger.warning(
+                        f"[_move_module_recursive] Failed to move param {param_name} to {target_device}: {e}"
+                    )
 
         for buf_name, buf in module._buffers.items():
             if buf is not None and not self._is_on_target_device(buf, target_device):
-                module._buffers[buf_name] = buf.to(target_device)
+                try:
+                    module._buffers[buf_name] = buf.to(target_device)
+                except Exception as e:
+                    logger.warning(
+                        f"[_move_module_recursive] Failed to move buffer {buf_name} to {target_device}: {e}"
+                    )
 
         # Traverse registered submodules (covers standard PyTorch modules
         # and PEFT-registered LoRA layers).
@@ -90,6 +110,18 @@ class InitServiceMemoryTransferMixin:
             logger.info(
                 "[_recursive_to_device] model.to() raised NotImplementedError "
                 "(AffineQuantizedTensor on older torch). Moving parameters individually."
+            )
+        except Exception as e:
+            """Catch additional exceptions (e.g., Windows torch C++ segfault wrap).
+            On Windows with CUDA, torch tensor device transfers can trigger
+            'Windows fatal exception: access violation' during memory cleanup.
+            Catching and logging allows generation to complete even if cleanup fails.
+            See: https://github.com/AgriciDaniel/claude-music/issues/XX
+            """
+            fast_path_ok = False
+            logger.warning(
+                f"[_recursive_to_device] model.to() raised {type(e).__name__}: {e}. "
+                "Proceeding with recursive sweep; some tensors may remain on original device."
             )
 
         # Always run recursive sweep as a safety net.  This catches PEFT/LoRA
